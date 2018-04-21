@@ -207,6 +207,7 @@ void cleanup() {
     free(last_index_per_partition);
     free(iterator_indices);
     free(partition_locks);
+    free(partition_size);
 }
 
 void MR_Run(int argc, char *argv[], Mapper map, int num_mappers, 
