@@ -5,7 +5,6 @@
 #include "mapreduce.h"
 
 //definitions
-#define MIN_KEYS_PER_PARTITION 50
 
 typedef struct _kv {
     char *key;
@@ -23,6 +22,7 @@ char **fileq;
 Partitioner p_fn;
 int NUM_PARTITIONS;
 
+int *partition_size;
 kv ***partitions;
 int *last_index_per_partition;
 pthread_mutex_t *partition_locks;
@@ -54,8 +54,9 @@ void insert_kv(char *key, char *value, int partition) {
     kv_pair->value = value;
     pthread_mutex_lock(&partition_locks[partition]);
     int idx = last_index_per_partition[partition];
-    if ((idx + 1) > 0 && (idx + 1) % MIN_KEYS_PER_PARTITION == 0) {
-        partitions[partition] = realloc(partitions[partition], (idx + 1 + MIN_KEYS_PER_PARTITION) * sizeof(kv *));
+    if ((idx + 1) > 0 && (idx + 1) % partition_size[partition] == 0) {
+        partition_size[partition] *= 2;
+        partitions[partition] = realloc(partitions[partition], partition_size[partition] * sizeof(kv *));
     }
     last_index_per_partition[partition]++;
     partitions[partition][last_index_per_partition[partition]] = kv_pair;
@@ -170,10 +171,12 @@ void initialize(int argc, char *argv[], int num_reducers, Partitioner partition)
     last_index_per_partition = (int *) malloc(NUM_PARTITIONS * sizeof(int));
     partition_locks = (pthread_mutex_t *) malloc(NUM_PARTITIONS * sizeof(pthread_mutex_t));
     iterator_indices = (int *) malloc(NUM_PARTITIONS * sizeof(int));
+    partition_size = (int *) malloc(NUM_PARTITIONS * sizeof(int));
 
     int i;
     for (i = 0; i < NUM_PARTITIONS; i++) {
-        partitions[i] = (kv **) malloc(MIN_KEYS_PER_PARTITION * sizeof(kv *));
+        partition_size[i] = 50;
+        partitions[i] = (kv **) malloc(partition_size[i] * sizeof(kv *));
         last_index_per_partition[i] = -1;
         iterator_indices[i] = 0;
         pthread_mutex_init(&partition_locks[i], NULL);
