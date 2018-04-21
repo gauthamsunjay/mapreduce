@@ -52,12 +52,13 @@ void insert_kv(char *key, char *value, int partition) {
     kv *kv_pair = (kv *) malloc(sizeof(kv));
     kv_pair->key = key;
     kv_pair->value = value;
-    
     pthread_mutex_lock(&partition_locks[partition]);
-    if ((last_index_per_partition[partition] + 1) > 0 && (last_index_per_partition[partition] + 1) % MIN_KEYS_PER_PARTITION == 0) {
-        partitions[partition] = realloc(partitions[partition], (last_index_per_partition[partition] + 1 + MIN_KEYS_PER_PARTITION) * sizeof(kv *));
+    int idx = last_index_per_partition[partition];
+    if ((idx + 1) > 0 && (idx + 1) % MIN_KEYS_PER_PARTITION == 0) {
+        partitions[partition] = realloc(partitions[partition], (idx + 1 + MIN_KEYS_PER_PARTITION) * sizeof(kv *));
     }
-    partitions[partition][++last_index_per_partition[partition]] = kv_pair;
+    last_index_per_partition[partition]++;
+    partitions[partition][last_index_per_partition[partition]] = kv_pair;
     pthread_mutex_unlock(&partition_locks[partition]);
 }
 
@@ -163,6 +164,7 @@ void initialize(int argc, char *argv[], int num_reducers, Partitioner partition)
     fileq = argv;
     p_fn = partition;
     NUM_PARTITIONS = num_reducers;
+    pthread_mutex_init(&file_lock, NULL);
 
     partitions = (kv ***) malloc(NUM_PARTITIONS * sizeof(kv **));
     last_index_per_partition = (int *) malloc(NUM_PARTITIONS * sizeof(int));
@@ -174,6 +176,7 @@ void initialize(int argc, char *argv[], int num_reducers, Partitioner partition)
         partitions[i] = (kv **) malloc(MIN_KEYS_PER_PARTITION * sizeof(kv *));
         last_index_per_partition[i] = -1;
         iterator_indices[i] = 0;
+        pthread_mutex_init(&partition_locks[i], NULL);
     }
 }
 
@@ -191,12 +194,16 @@ void cleanup() {
     int i, j;
     for (i = 0; i < NUM_PARTITIONS; i++) {
         for (j = 0; j <= last_index_per_partition[i]; j++) {
+            free(partitions[i][j]->key);
+            free(partitions[i][j]->value);
             free(partitions[i][j]);
         }
         free(partitions[i]);
+        pthread_mutex_destroy(&partition_locks[i]);
     }
     free(last_index_per_partition);
     free(iterator_indices);
+    free(partition_locks);
 }
 
 void MR_Run(int argc, char *argv[], Mapper map, int num_mappers, 
