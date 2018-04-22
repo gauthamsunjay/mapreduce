@@ -142,6 +142,18 @@ void *reducer_thread(void *args) {
             _rargs->reduce(kvp->key, get_next, _rargs->partition);
         }
     }
+    
+    int j;
+    int i = _rargs->partition;
+    for (j = 0; j <= last_index_per_partition[i]; j++) {
+        free(partitions[i][j]->key);
+        free(partitions[i][j]->value);
+        free(partitions[i][j]);
+    }
+
+    free(partitions[i]);
+    pthread_mutex_destroy(&partition_locks[i]);
+
     return NULL;
 }
 
@@ -175,7 +187,7 @@ void initialize(int argc, char *argv[], int num_reducers, Partitioner partition)
 
     int i;
     for (i = 0; i < NUM_PARTITIONS; i++) {
-        partition_size[i] = 50;
+        partition_size[i] = 64;
         partitions[i] = (kv **) malloc(partition_size[i] * sizeof(kv *));
         last_index_per_partition[i] = -1;
         iterator_indices[i] = 0;
@@ -194,16 +206,7 @@ void print_values() {
 }
 
 void cleanup() {
-    int i, j;
-    for (i = 0; i < NUM_PARTITIONS; i++) {
-        for (j = 0; j <= last_index_per_partition[i]; j++) {
-            free(partitions[i][j]->key);
-            free(partitions[i][j]->value);
-            free(partitions[i][j]);
-        }
-        free(partitions[i]);
-        pthread_mutex_destroy(&partition_locks[i]);
-    }
+    free(partitions);
     free(last_index_per_partition);
     free(iterator_indices);
     free(partition_locks);
