@@ -1,32 +1,46 @@
+/*
+    Data structure for each partition:
+    Hash table with open addressing. This is to make sorting easier. 
+    Every entry in the hash table is a knode which stores the reference to the values list.
+*/
+
 #include<pthread.h>
 #include<stdlib.h>
 #include<stdio.h>
 #include<string.h>
 #include "mapreduce.h"
 
-//definitions
+#define HASH_MAP_SIZE 16384
+#define SUBSET_PER_LOCK 32
 
-typedef struct _kv {
-    char *key;
+typedef struct _valnode {
     char *value;
-} kv;
+    struct _valnode *next;
+} ValNode;
+
+typedef struct _knode {
+    char *key;
+    struct _valnode *head; // head of the values list
+    pthread_mutex_t lock;
+    struct _valnode *to_free;
+} KeyNode;
 
 typedef struct _reducer_args {
     int partition;
     Reducer reduce;
 } rargs;
 
-pthread_mutex_t file_lock;
 int total_files;
+int cfile;
+int num_locks = HASH_MAP_SIZE / SUBSET_PER_LOCK;
 char **fileq;
 Partitioner p_fn;
 int NUM_PARTITIONS;
+pthread_mutex_t file_lock;
 
-int *partition_size;
-kv ***partitions;
-int *last_index_per_partition;
-pthread_mutex_t *partition_locks;
-int *iterator_indices;
+pthread_mutex_t **subset_locks;
+KeyNode ***hash_maps;
+int *cur_node_in_partition;
 
 unsigned long MR_DefaultHashPartition(char *key, int num_partitions) {
     unsigned long hash = 5381;
@@ -36,70 +50,82 @@ unsigned long MR_DefaultHashPartition(char *key, int num_partitions) {
     return hash % num_partitions;
 }
 
-char *get_next(char *key, int partition_number) {
-    int idx = iterator_indices[partition_number];
-    if (idx <= last_index_per_partition[partition_number]) {
-        kv *kv_pair = partitions[partition_number][idx];
-        if (strcmp(kv_pair->key, key) == 0) {
-            iterator_indices[partition_number]++;
-            return kv_pair->value;
-        }
-    }
-    return NULL;
+unsigned long hash_fn(char *key) {
+    unsigned long hash = 0;
+    int c;
+    while ((c = *key++) != '\0')
+        hash = c + (hash << 6) + (hash << 16) - hash;
+
+    // while ((c = *key++) != '\0')
+    //     hash = hash * 33 + c;
+    
+    return hash;
 }
 
-void insert_kv(char *key, char *value, int partition) {
-    kv *kv_pair = (kv *) malloc(sizeof(kv));
-    kv_pair->key = key;
-    kv_pair->value = value;
-    pthread_mutex_lock(&partition_locks[partition]);
-    int idx = last_index_per_partition[partition];
-    if ((idx + 1) > 0 && (idx + 1) % partition_size[partition] == 0) {
-        partition_size[partition] *= 2;
-        partitions[partition] = realloc(partitions[partition], partition_size[partition] * sizeof(kv *));
+void insert_val(KeyNode *knode, char *value) {
+    ValNode *vnode = (ValNode *) malloc(sizeof(ValNode));
+    vnode->value = value;
+    pthread_mutex_lock(&knode->lock);
+    vnode->next = knode->head;
+    knode->head = vnode;
+    pthread_mutex_unlock(&knode->lock);
+}
+
+void hm_put(char *key, char *value, int partition) {
+    unsigned long hash = hash_fn(key);
+    int bucket = hash % HASH_MAP_SIZE;
+    int exists = 0;
+
+    int current_subset = (bucket & 0x03FE0) >> 5;
+    int new_subset;
+
+    pthread_mutex_lock(&subset_locks[partition][current_subset]);
+    while (hash_maps[partition][bucket] != NULL) {
+        if (strcmp(hash_maps[partition][bucket]->key, key) == 0) {
+            exists = 1;
+            pthread_mutex_unlock(&subset_locks[partition][current_subset]);
+            break;
+        }
+        bucket++;
+
+        bucket = bucket % HASH_MAP_SIZE;
+        new_subset = (bucket & 0x03FE0) >> 5;
+
+        if (new_subset != current_subset) {
+            pthread_mutex_unlock(&subset_locks[partition][current_subset]);
+            current_subset = new_subset;
+            pthread_mutex_lock(&subset_locks[partition][current_subset]);
+        }
     }
-    last_index_per_partition[partition]++;
-    partitions[partition][last_index_per_partition[partition]] = kv_pair;
-    pthread_mutex_unlock(&partition_locks[partition]);
+    
+    if (exists) {
+        free(key);
+    }
+
+    else {
+        KeyNode *knode = (KeyNode *) malloc(sizeof(KeyNode));
+        knode->key = key;
+        knode->head = NULL;
+        knode->to_free = NULL;
+        pthread_mutex_init(&knode->lock, NULL);
+
+        hash_maps[partition][bucket] = knode;
+        pthread_mutex_unlock(&subset_locks[partition][current_subset]);
+    }
+    
+    insert_val(hash_maps[partition][bucket], value);
 }
 
 void MR_Emit(char *k, char *v) {
-    char *key = (char *) malloc(sizeof(char) * strlen(k));
-    char *val = (char *) malloc(sizeof(char) * strlen(v));
+    char *key = (char *) malloc(strlen(k));
+    char *val = (char *) malloc(strlen(v));
     key = strcpy(key, k);
     val = strcpy(val, v);
     int partition = p_fn(key, NUM_PARTITIONS);
-    insert_kv(key, val, partition);
-}
-
-int compare_keys(const void *p, const void *q) {
-    kv *kv1 = *((kv **) p);
-    kv *kv2 = *((kv **) q);
-    return strcmp(kv1->key, kv2->key);
-}
-
-void *sorter(void *arg) {
-    int partition = *((int *) arg);
-    qsort(partitions[partition], last_index_per_partition[partition] + 1, sizeof(kv *), compare_keys);
-    return NULL;
-}
-
-void sort_keys() {
-    int i;
-    pthread_t sorter_threads[NUM_PARTITIONS];
-    int partitions[NUM_PARTITIONS];
-    for (i = 0; i < NUM_PARTITIONS; i++) {
-        partitions[i] = i;
-        pthread_create(&sorter_threads[i], NULL, sorter, &partitions[i]);
-    }
-
-    for (i = 0; i < NUM_PARTITIONS; i++) {
-        pthread_join(sorter_threads[i], NULL);
-    }
+    hm_put(key, val, partition);
 }
 
 char* fetch_file() {
-    static int cfile = 0;
     int i;
     pthread_mutex_lock(&file_lock);
     i = ++cfile;
@@ -131,29 +157,89 @@ void execute_mappers(Mapper map, int num_mappers) {
     }
 }
 
-void *reducer_thread(void *args) {
-    rargs *_rargs = (rargs *) args;
-    if (last_index_per_partition[_rargs->partition] >= 0) {
-        while (1) {
-            if (iterator_indices[_rargs->partition] > last_index_per_partition[_rargs->partition])
-                break;
+int compare_keys(const void *p, const void *q) {
+    KeyNode *kn1 = *((KeyNode **) p);
+    KeyNode *kn2 = *((KeyNode **) q);
 
-            kv *kvp = partitions[_rargs->partition][iterator_indices[_rargs->partition]];
-            _rargs->reduce(kvp->key, get_next, _rargs->partition);
+    int rv;
+
+    if (!kn1) {
+        rv = 1;
+    }
+
+    else if (!kn2) {
+        rv = -1;
+    }
+
+    else {
+        rv = strcmp(kn1->key, kn2->key);
+    }
+
+    return rv;
+}
+
+void *sorter(void *arg) {
+    int partition = *((int *) arg);
+    qsort(hash_maps[partition], HASH_MAP_SIZE, sizeof(KeyNode *), compare_keys);
+    return NULL;
+}
+
+void sort_keys() {
+    int i;
+    pthread_t sorter_threads[NUM_PARTITIONS];
+    int partitions[NUM_PARTITIONS];
+    for (i = 0; i < NUM_PARTITIONS; i++) {
+        partitions[i] = i;
+        pthread_create(&sorter_threads[i], NULL, sorter, &partitions[i]);
+    }
+
+    for (i = 0; i < NUM_PARTITIONS; i++) {
+        pthread_join(sorter_threads[i], NULL);
+    }
+}
+
+char *get_next(char *key, int partition) {
+    KeyNode *knode = hash_maps[partition][cur_node_in_partition[partition]];
+
+    if (knode->head != NULL) {
+        if (knode->to_free != NULL) {
+            free(knode->to_free->value);
+            free(knode->to_free);
         }
+
+        knode->to_free = knode->head;
+        knode->head = knode->head->next;
+
+        return knode->to_free->value;
     }
     
-    int j;
-    int i = _rargs->partition;
-    for (j = 0; j <= last_index_per_partition[i]; j++) {
-        free(partitions[i][j]->key);
-        free(partitions[i][j]->value);
-        free(partitions[i][j]);
+    return NULL;
+}
+
+void *reducer_thread(void *args) {
+    rargs *_rargs = (rargs *) args;
+    KeyNode *knode;
+    int partition = _rargs->partition;
+
+    int i = 0;
+    while ((knode = hash_maps[partition][i]) != NULL && i < HASH_MAP_SIZE) {
+        cur_node_in_partition[partition] = i++;
+        _rargs->reduce(knode->key, get_next, partition);
+        if (knode->to_free != NULL) {
+            free(knode->to_free->value);
+            free(knode->to_free);
+        }
+        free(knode->key);
+        free(knode);
     }
 
-    free(partitions[i]);
-    pthread_mutex_destroy(&partition_locks[i]);
+    free(hash_maps[partition]);
 
+    for (i = 0; i < num_locks; i++) {
+        pthread_mutex_destroy(&subset_locks[partition][i]);
+    }
+    
+    free(subset_locks[partition]);
     return NULL;
 }
 
@@ -174,43 +260,51 @@ void execute_reducers(Reducer reduce) {
 
 void initialize(int argc, char *argv[], int num_reducers, Partitioner partition) {
     total_files = argc;
-    fileq = argv;
+    cfile = 0;
     p_fn = partition;
     NUM_PARTITIONS = num_reducers;
     pthread_mutex_init(&file_lock, NULL);
+    
+    fileq = argv;
+    hash_maps = (KeyNode ***) malloc(NUM_PARTITIONS * sizeof(KeyNode **));
+    cur_node_in_partition = (int *) malloc(NUM_PARTITIONS * sizeof(int));
+    subset_locks = (pthread_mutex_t **) malloc(NUM_PARTITIONS * sizeof(pthread_mutex_t *));
+    
+    int i, j;
 
-    partitions = (kv ***) malloc(NUM_PARTITIONS * sizeof(kv **));
-    last_index_per_partition = (int *) malloc(NUM_PARTITIONS * sizeof(int));
-    partition_locks = (pthread_mutex_t *) malloc(NUM_PARTITIONS * sizeof(pthread_mutex_t));
-    iterator_indices = (int *) malloc(NUM_PARTITIONS * sizeof(int));
-    partition_size = (int *) malloc(NUM_PARTITIONS * sizeof(int));
-
-    int i;
     for (i = 0; i < NUM_PARTITIONS; i++) {
-        partition_size[i] = 64;
-        partitions[i] = (kv **) malloc(partition_size[i] * sizeof(kv *));
-        last_index_per_partition[i] = -1;
-        iterator_indices[i] = 0;
-        pthread_mutex_init(&partition_locks[i], NULL);
-    }
+        hash_maps[i] = (KeyNode **) calloc(HASH_MAP_SIZE, sizeof(KeyNode *));
+        cur_node_in_partition[i] = -1;
+        subset_locks[i] = (pthread_mutex_t *) malloc(num_locks * sizeof(pthread_mutex_t));
+        for (j = 0; j < num_locks; j++) {
+            pthread_mutex_init(&subset_locks[i][j], NULL);
+        }
+    } 
 }
 
 void print_values() {
     int i, j;
     for (i = 0; i < NUM_PARTITIONS; i++) {
         printf("Partition = %d\n", i);
-        for (j = 0; j <= last_index_per_partition[i]; j++) {
-            printf("Key = %s, value = %s\n", partitions[i][j]->key, partitions[i][j]->value);
+        for (j = 0; j < HASH_MAP_SIZE; j++) {
+            KeyNode *ktemp = hash_maps[i][j];
+            if (ktemp) {
+                ValNode *temp = ktemp->head;
+                printf("Key = %s\n", ktemp->key);
+                while (temp != NULL) {
+                    printf("Value = %s\n", temp->value);
+                    temp = temp->next;
+                }
+                printf("\n");
+            }
         }
     }
 }
 
 void cleanup() {
-    free(partitions);
-    free(last_index_per_partition);
-    free(iterator_indices);
-    free(partition_locks);
-    free(partition_size);
+    free(hash_maps);
+    free(subset_locks);
+    free(cur_node_in_partition);
 }
 
 void MR_Run(int argc, char *argv[], Mapper map, int num_mappers, 
@@ -218,11 +312,7 @@ void MR_Run(int argc, char *argv[], Mapper map, int num_mappers,
     
     initialize(argc, argv, num_reducers, partition);
     execute_mappers(map, num_mappers);
-    /*printf("--------------------\n");
-    print_values();*/
     sort_keys();
-    /*printf("--------------------\n");
-    print_values();*/
     execute_reducers(reduce);
     cleanup();
 }

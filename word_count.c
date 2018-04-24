@@ -16,6 +16,7 @@ void Map(char *file_name) {
         while ((token = strsep(&dummy, " \n")) != NULL) {
             MR_Emit(token, "1");
         }
+        free(dummy);
     }
     free(line);
     fclose(fp);
@@ -30,6 +31,6 @@ void Reduce(char *key, Getter get_next, int partition_number) {
 }
 
 int main(int argc, char *argv[]) {
-    MR_Run(argc, argv, Map, 2, Reduce, 2, MR_DefaultHashPartition);
+    MR_Run(argc, argv, Map, 2, Reduce, 8, MR_DefaultHashPartition);
     return 0;
 }
